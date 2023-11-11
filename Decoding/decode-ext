@@ -1,0 +1,214 @@
+#!/usr/bin/env python
+import optparse
+import sys
+import models
+from collections import namedtuple
+from functools import reduce
+
+optparser = optparse.OptionParser()
+optparser.add_option("-i", "--input", dest="input", default="data/input",
+                     help="File containing sentences to translate (default=data/input)")
+optparser.add_option("-t", "--translation-model", dest="tm", default="data/tm",
+                     help="File containing translation model (default=data/tm)")
+optparser.add_option("-l", "--language-model", dest="lm", default="data/lm",
+                     help="File containing ARPA-format language model (default=data/lm)")
+optparser.add_option("-n", "--num_sentences", dest="num_sents", default=sys.maxsize,
+                     type="int", help="Number of sentences to decode (default=no limit)")
+optparser.add_option("-k", "--translations-per-phrase", dest="k", default=1, type="int",
+                     help="Limit on number of translations to consider per phrase (default=1)")
+optparser.add_option("-s", "--stack-size", dest="s", default=1000,
+                     type="int", help="Maximum stack size (default=1)")
+optparser.add_option("-v", "--verbose", dest="verbose", action="store_true",
+                     default=False,  help="Verbose mode (default=off)")
+optparser.add_option("-m", "--mode", dest="mode", default=3, type="int",
+                     help="Which decoder to use, 0 for simple decoder, 1 for beam search, 2 for greedy, 3 for greedy from beam search")
+opts = optparser.parse_args()[0]
+
+
+def bitmap(sequence):
+    """ Generate a coverage bitmap for a sequence of indexes """
+    return reduce(lambda x, y: x | y, map(lambda i: int('1'+'0'*i, 2), sequence), 0)
+
+
+def bitmap_length(v):
+    return bin(v).count("1")
+
+
+def get_first_vacancy(v):
+    ans = 0
+    while v % 2:
+        ans += 1
+        v //= 2
+    return ans
+
+
+def extract_english(h):
+    return "" if h.predecessor is None else "%s%s " % (extract_english(h.predecessor), h.phrase.english)
+
+
+def extract_phrases(h):
+    ans = []
+    while h:
+        if h.phrase:
+            ans.append(h.phrase)
+        h = h.predecessor
+    ans.reverse()
+    return ans
+
+
+def get_english_from_phrases(phrases):
+    ans = ""
+    for phrase in phrases:
+        ans += "%s " % (phrase.english)
+    return ans
+
+
+def get_lm_score(lm, sentense):
+    prob = 0
+    state = lm.begin()
+    for word in sentense.split():
+        (state, word_logprob) = lm.score(
+            state, word)
+        prob += word_logprob
+    prob += lm.end(state)
+    return prob
+
+
+def get_neighbors(phrases):
+    neighbors = []
+    l = len(phrases)
+    for i in range(l-1):
+        for j in range(i+1, l):
+            neighbors.append([p for p in phrases])
+            neighbors[-1][i], neighbors[-1][j] = neighbors[-1][j], neighbors[-1][i]
+    for i in range(l):
+        for j in range(l):
+            if i == j:
+                continue
+            neighbors.append([p for p in phrases])
+            neighbors[-1].insert(j, neighbors[-1][i])
+            if j > i:
+                neighbors[-1].pop(i)
+            else:
+                neighbors[-1].pop(i+1)
+    return neighbors
+
+
+def simple_decode(tm, lm, f):
+    return extract_english(simple_decode_helper(tm, lm, f))
+
+
+def simple_decode_helper(tm, lm, f):
+    hypothesis = namedtuple(
+        "hypothesis", "logprob, lm_state, predecessor, phrase")
+    initial_hypothesis = hypothesis(0.0, lm.begin(), None, None)
+    stacks = [{} for _ in f] + [{}]
+    stacks[0][lm.begin()] = initial_hypothesis
+    for i, stack in enumerate(stacks[:-1]):
+        # prune
+        for h in sorted(stack.values(), key=lambda h: -h.logprob)[:1]:
+            for j in range(i+1, len(f)+1):
+                if f[i:j] in tm:
+                    for phrase in tm[f[i:j]]:
+                        logprob = h.logprob + phrase.logprob
+                        lm_state = h.lm_state
+                        for word in phrase.english.split():
+                            (lm_state, word_logprob) = lm.score(
+                                lm_state, word)
+                            logprob += word_logprob
+                        logprob += lm.end(lm_state) if j == len(f) else 0.0
+                        new_hypothesis = hypothesis(
+                            logprob, lm_state, h, phrase)
+                        # second case is recombination
+                        if lm_state not in stacks[j] or stacks[j][lm_state].logprob < logprob:
+                            stacks[j][lm_state] = new_hypothesis
+    winner = max(stacks[-1].values(), key=lambda h: h.logprob)
+    return winner
+
+
+def beam_search_decode(tm, lm, f):
+    return extract_english(beam_search_decode_helper(tm, lm, f))
+
+
+def beam_search_decode_helper(tm, lm, f):
+    state = namedtuple("state", "lm_state, bitmap")
+    hypothesis = namedtuple(
+        "hypothesis", "logprob, lm_state, predecessor, phrase, bitmap")
+    phrases_list = [[] for _ in f]
+    for fi in range(len(f)):
+        for fj in range(fi+1, len(f)+1):
+            if f[fi:fj] in tm:
+                for phrase in tm[f[fi:fj]]:
+                    phrases_list[fi].append(
+                        (phrase, bitmap(range(fi, fj))))
+
+    initial_hypothesis = hypothesis(0.0, lm.begin(), None, None, 0)
+    stacks = [{} for _ in f] + [{}]
+    stacks[0][state(lm.begin(), 0)] = initial_hypothesis
+    for stack in stacks[:-1]:
+        for h in sorted(stack.values(), key=lambda h: -h.logprob)[:opts.s]:
+            first_vacancy = get_first_vacancy(h.bitmap)
+            for phrases in phrases_list[first_vacancy:]:
+                for phrase, v in phrases:
+                    if h.bitmap & v != 0:
+                        continue
+                    new_v = h.bitmap | v
+                    new_len = bitmap_length(new_v)
+                    logprob = h.logprob + phrase.logprob
+                    lm_state = h.lm_state
+                    for word in phrase.english.split():
+                        (lm_state, word_logprob) = lm.score(
+                            lm_state, word)
+                        logprob += word_logprob
+                    logprob += lm.end(lm_state) if new_len == len(f) else 0.0
+                    new_hypothesis = hypothesis(
+                        logprob, lm_state, h, phrase, new_v)
+                    new_state = state(lm_state, new_v)
+                    # second case is recombination
+                    if new_state not in stacks[new_len] or stacks[new_len][new_state].logprob < logprob:
+                        stacks[new_len][new_state] = new_hypothesis
+    winner = max(stacks[-1].values(), key=lambda h: h.logprob)
+    return winner
+
+
+def greedy_decode(lm, phrases):
+    best_s = get_english_from_phrases(phrases)
+    best_prob = get_lm_score(lm, best_s)
+    while True:
+        neighbors = get_neighbors(phrases)
+        cur_s = get_english_from_phrases(phrases)
+        for neighbor in neighbors:
+            neighbor_s = get_english_from_phrases(neighbor)
+            neighbor_prob = get_lm_score(lm, neighbor_s)
+            if neighbor_prob > best_prob:
+                best_prob = neighbor_prob
+                best_s = neighbor_s
+                phrases = neighbor
+        if best_s == cur_s:
+            return best_s
+
+
+def run_decoder():
+    tm = models.TM(opts.tm, opts.k)
+    lm = models.LM(opts.lm)
+    french = [tuple(line.strip().split())
+              for line in open(opts.input).readlines()[:opts.num_sents]]
+    # tm should translate unknown words as-is with probability 1
+    for word in set(sum(french, ())):
+        if (word,) not in tm:
+            tm[(word,)] = [models.phrase(word, 0.0)]
+    sys.stderr.write("Decoding %s...\n" % (opts.input,))
+    for f in french:
+        if opts.mode == 0:
+            print(simple_decode(tm, lm, f))
+        elif opts.mode == 1:
+            print(beam_search_decode(tm, lm, f))
+        elif opts.mode == 2:
+            phrases = extract_phrases(simple_decode_helper(tm, lm, f))
+            print(greedy_decode(lm, phrases))
+        else:
+            phrases = extract_phrases(beam_search_decode_helper(tm, lm, f))
+            print(greedy_decode(lm, phrases))
+
+
+run_decoder()
