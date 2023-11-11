@@ -1,11 +1,17 @@
-There are two python programs here (-h for usage):
+There are three python programs here (-h for usage):
 
 - `decode` translates input sentences from French to English.
+- `decode-ext` the decoder we implemented, support four modes: simple decoder, beam-search decoder, greedy decoder, greedy decoder from beam-search.
 - `grade` computes the model score of a translated sentence.
 
 These commands work in a pipeline. For example:
 
-    > python decode | python compute-model-score
+    > python decode | python grade
+
+To choose mode for `decode-ext`, use -m argument, 0 for simple decoder, 1 for beam search, 2 for greedy, 3 for greedy from beam search. The default mode is greedy decoder from beam-search.
+
+For example:
+    > `python3 decode-new -m 3 -s 10000 > translations`
 
 There is also a module:
 
